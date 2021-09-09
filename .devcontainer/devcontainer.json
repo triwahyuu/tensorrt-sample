@@ -1,0 +1,30 @@
+{
+	"name": "C++",
+	"dockerFile": "Dockerfile",
+	"extensions": [
+		"ms-vscode.cpptools",
+		"ms-vscode.cmake-tools",
+		"xaver.clang-format"
+	],
+	"runArgs": [
+		"--cap-add=SYS_PTRACE",
+		"--security-opt", "seccomp=unconfined",
+		// "--privileged",
+		// "-p=4004:4004",
+		"--net=host",
+		"--ipc=host",
+		"--gpus=all",
+		"--pid=host",
+		"--add-host=host.docker.internal:127.0.0.1",
+		"--device=/dev/video0:/dev/video0",
+		"--volume=/dev/video0:/dev/video0",
+		// "--device=/dev/dri:/dev/dri",
+		// "-e", "QT_X11_NO_MITSHM=1",
+		"-e", "DISPLAY=${env:DISPLAY}",
+		"--volume=${env:HOME}/.Xauthority:/root/.Xauthority:rw",
+		"--volume=/tmp/.X11-unix:/tmp/.X11-unix"
+	],
+	"remoteEnv": {
+		"LANG": "C.UTF-8"
+	}
+}
