@@ -1,0 +1,50 @@
+{
+    "tasks": [
+		{
+			"type": "shell",
+			"label": "clean all",
+			"command": "rm",
+			"args": [
+				"-rf", "*"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/build"
+			},
+			"group": "none"
+		},
+		{
+			"type": "shell",
+			"label": "configure",
+			"command": "cmake",
+			"args": [
+				"-DCMAKE_BUILD_TYPE=Debug",
+				".."
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/build"
+			},
+			"group": "build",
+			"dependsOn": "clean all",
+			"problemMatcher": []
+		},
+		{
+			"type": "shell",
+			"label": "build",
+			"command": "make",
+			"args": [
+				"-j6"
+			],
+			"options": {
+				"cwd": "${workspaceFolder}/build"
+			},
+			"problemMatcher": [
+				"$gcc"
+			],
+			"group": {
+				"kind": "build",
+				"isDefault": true
+			}
+		}
+	],
+    "version": "2.0.0"
+}
