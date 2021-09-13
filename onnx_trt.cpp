@@ -3,13 +3,25 @@
 #include <vector>
 #include <string>
 #include <memory>
+#include <numeric>
 
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
 #include <cuda_runtime_api.h>
+#include <opencv2/imgcodecs.hpp>
+#include <opencv2/core/cuda.hpp>
+#include <opencv2/cudawarping.hpp>
+#include <opencv2/cudaarithm.hpp>
 
 #include "common.hpp"
 
+
+struct result_t
+{
+    float conf{0.};
+    size_t idx;
+    std::string label;
+};
 
 struct ModelParams
 {
@@ -20,6 +32,7 @@ struct ModelParams
     std::vector<std::string> output_names;
     std::string model_path;
     std::string engine_path;
+    std::string names_path;
 };
 
 class Logger : public nvinfer1::ILogger
@@ -73,15 +86,6 @@ struct CudaStreamDestroy
 
 using CudaStreamUniquePtr = std::unique_ptr<cudaStream_t, CudaStreamDestroy>;
 
-CudaStreamUniquePtr make_cuda_stream()
-{
-    cudaStream_t* stream;
-    CUDA_CHECK(cudaStreamCreate(stream));
-    CudaStreamUniquePtr pStream;
-    pStream.reset(stream);
-    return std::move(pStream);
-}
-
 size_t getSizeByDim(const nvinfer1::Dims& dims)
 {
     size_t size = 1;
@@ -100,6 +104,30 @@ bool file_exists(std::string& filename)
     return true;
 }
 
+std::vector<std::string> get_class_names(const std::string& cls_path)
+{
+    std::ifstream fp{cls_path};
+    if(!fp)
+        throw std::runtime_error("class name file in " + cls_path + " is not found");
+
+    std::vector<std::string> classes;
+    std::string name;
+    while(std::getline(fp, name)) {
+        classes.push_back(name);
+    }
+    return classes;
+}
+
+template <class T>
+std::vector<T> softmax(std::vector<T>& data)
+{
+    std::vector<T> result;
+    std::transform(data.begin(), data.end(), std::back_inserter(result), [](T val){return std::exp(val);});
+    auto sum = std::accumulate(result.begin(), result.end(), 0.0);
+    std::transform(result.begin(), result.end(), result.begin(), [&sum](T val){return val/sum;});
+    return result;
+}
+
 class SampleOnnx
 {
 public:
@@ -111,23 +139,23 @@ public:
 
     ~SampleOnnx()
     {
-        for (void* b : m_input_buffers) {
+        for (void* b : m_buffers) {
             cudaFree(b);
         }
-        for (void* b : m_output_buffers) {
-            cudaFree(b);
-        }
-        m_input_buffers.clear();
-        m_output_buffers.clear();
+        m_buffers.clear();
+
+        cudaStreamDestroy(m_stream);
     }
 
     bool init();
 
     bool preprocess(const std::string& img_path);
 
+    bool preprocess(const cv::Mat& image);
+
     bool infer();
 
-    bool postprocess();
+    std::vector<result_t> postprocess(size_t topk);
 
     bool serialize();
 
@@ -143,14 +171,16 @@ public:
 
 private:
     ModelParams m_params;
+    std::vector<std::string> m_class_names;
     std::vector<nvinfer1::Dims> m_input_dims;
     std::vector<nvinfer1::Dims> m_output_dims;
-    std::vector<void *> m_input_buffers;
-    std::vector<void *> m_output_buffers;
+    std::vector<size_t> m_input_idx;
+    std::vector<size_t> m_output_idx;
+    std::vector<void *> m_buffers;
 
     TRTUniquePtr<nvinfer1::ICudaEngine> m_engine{nullptr};
     TRTUniquePtr<nvinfer1::IExecutionContext> m_context{nullptr};
-    CudaStreamUniquePtr m_stream;
+    cudaStream_t m_stream;
 
     bool prepare_engine();
 };
@@ -158,9 +188,7 @@ private:
 
 bool SampleOnnx::init()
 {
-    cudaStream_t stream;
-    CUDA_CHECK(cudaStreamCreate(&stream));
-    m_stream.reset(&stream);
+    CUDA_CHECK(cudaStreamCreate(&m_stream));
 
     if(!file_exists(m_params.engine_path))
     {
@@ -191,18 +219,21 @@ bool SampleOnnx::init()
         // TODO: check cuda error
         void* temp;
         cudaMalloc(&temp, binding_size);
+        m_buffers.push_back(temp);
         if(m_engine->bindingIsInput(i)) {
             m_input_dims.push_back(binding_dim);
-            m_input_buffers.push_back(temp);
+            m_input_idx.push_back(i);
         }
         else {
             m_output_dims.push_back(binding_dim);
-            m_output_buffers.push_back(temp);
+            m_output_idx.push_back(i);
         }
     }
 
     if (m_input_dims.empty() || m_output_dims.empty())
         throw std::runtime_error("Expect at least one input and one output for the network");
+
+    m_class_names = get_class_names(m_params.names_path);
 
     return true;
 }
@@ -258,6 +289,7 @@ bool SampleOnnx::prepare_engine()
     if (m_context == nullptr)
         throw std::runtime_error("Execution Context creation failed");
 
+    cudaStreamDestroy(profile_stream);
     return true;
 }
 
@@ -327,6 +359,89 @@ bool SampleOnnx::deserialize(const std::string& filepath)
     return true;
 }
 
+
+bool SampleOnnx::preprocess(const std::string& img_path)
+{
+    auto img = cv::imread(img_path);
+    if (img.empty()) {
+        std::cerr << "load image " << img_path << " failed\n";
+        return false;
+    }
+    return preprocess(img);
+}
+
+bool SampleOnnx::preprocess(const cv::Mat& image)
+{
+    auto input_width = m_input_dims[0].d[3];
+    auto input_height = m_input_dims[0].d[2];
+    auto input_channel = m_input_dims[0].d[1];
+    auto input_size = cv::Size(input_width, input_height);
+
+    // cv::Mat resized;
+    // cv::resize(image, resized, input_size);
+    // cv::Mat input_img;
+    // resized.convertTo(input_img, CV_32FC3, 1.f/255.f);
+    // cv::subtract(input_img, cv::Scalar(0.485f, 0.456f, 0.406f), input_img);
+    // cv::divide(input_img, cv::Scalar(0.229f, 0.224f, 0.225f), input_img, 1, -1);
+
+    // cv::Mat flatten[input_channel];
+    // cv::split(input_img, flatten);
+    // for (size_t i = 0; i < input_channel; i++) {
+
+    // }
+
+    cv::cuda::GpuMat gpu_img;
+    gpu_img.upload(image);
+    cv::cuda::GpuMat resized;
+    cv::cuda::resize(gpu_img, resized, input_size, 0, 0, cv::INTER_NEAREST);
+
+    cv::cuda::GpuMat gpu_norm;
+    resized.convertTo(gpu_norm, CV_32FC3, 1.f/255.f);
+    cv::cuda::subtract(gpu_norm, cv::Scalar(0.406f, 0.456f, 0.485f), gpu_norm, cv::noArray());
+    cv::cuda::divide(gpu_norm, cv::Scalar(0.225f, 0.224f, 0.229f), gpu_norm);
+    // cv::cuda::subtract(gpu_norm, cv::Scalar(0.485f, 0.456f, 0.406f), gpu_norm, cv::noArray());
+    // cv::cuda::divide(gpu_norm, cv::Scalar(0.229f, 0.224f, 0.225f), gpu_norm);
+
+    std::vector<cv::cuda::GpuMat> chw;
+    for (int i = input_channel-1; i >= 0; i--)
+        chw.push_back(cv::cuda::GpuMat(input_size, CV_32FC1, (float *) m_buffers[m_input_idx[0]] + i*input_width*input_height));
+    cv::cuda::split(gpu_norm, chw);
+
+    return true;
+}
+
+bool SampleOnnx::infer()
+{
+    m_context->enqueue(m_params.batch_size, m_buffers.data(), m_stream, nullptr);
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
+    return true;
+}
+
+std::vector<result_t> SampleOnnx::postprocess(size_t topk)
+{
+    std::vector<result_t> results(topk);
+    std::vector<float> output(getSizeByDim(m_output_dims[0]) * m_params.batch_size);
+    cudaMemcpy(output.data(), m_buffers[m_output_idx[0]], output.size() * sizeof(float), cudaMemcpyDeviceToHost);
+
+    auto out_softmax = softmax(output);
+    std::vector<size_t> indices(getSizeByDim(m_output_dims[0]) * m_params.batch_size);
+    std::iota(indices.begin(), indices.end(), 0);
+    std::sort(
+        indices.begin(), indices.end(),
+        [&out_softmax](size_t i1, size_t i2){
+            return out_softmax[i1] > out_softmax[i2];
+        }
+    );
+    for (size_t i = 0; i < topk; i++) {
+        auto idx = indices[i];
+        results[i].conf = out_softmax[idx];
+        results[i].idx = idx;
+        results[i].label = m_class_names[idx];
+    }
+    return results;
+}
+
+
 int main(int argc, char **argv)
 {
     ModelParams mp;
@@ -334,28 +449,28 @@ int main(int argc, char **argv)
     mp.fp16 = false;
     mp.model_path = "/workspaces/tensorrt-sample/data/resnet18.onnx";
     mp.engine_path = "/workspaces/tensorrt-sample/build/resnet18.rt";
+    // mp.model_path = "/workspaces/tensorrt-sample/data/resnet101.onnx";
+    // mp.engine_path = "/workspaces/tensorrt-sample/build/resnet101.rt";
+    mp.names_path = "/workspaces/tensorrt-sample/data/imagenet-classes.txt";
     mp.workspace_size = 512_MiB;
+
+    // std::string img_path = "/workspaces/tensorrt-sample/data/eagle.jpg";
+    std::string img_path = "/workspaces/tensorrt-sample/data/shark.jpg";
+    if (argc > 1)
+        img_path = argv[1];
 
     {
         SampleOnnx trt_engine(mp);
 
         trt_engine.init();
 
-        // std::cout << "construncting engine..\n";
-        // auto build_stat = trt_engine.build();
-        // if (!build_stat)
-        //     throw std::runtime_error("engine build failed!!");
-
-        // std::cout << "serializing..\n";
-        // auto serial_stat = trt_engine.serialize(mp.engine_path);
-        // if(!serial_stat)
-        //     throw std::runtime_error("serialize failed");
-
-        // std::cout << "deserializing..\n";
-        // trt_engine.deserialize(mp.engine_path);
-        // std::cout << "done..\n";
+        std::cout << "\n" << img_path << "\n";
+        trt_engine.preprocess(img_path);
+        trt_engine.infer();
+        auto results = trt_engine.postprocess(5);
+        for (auto& r : results) {
+            std::cout << r.idx << "  " << r.label << " (" << r.conf << ")\n";
+        }
     }
-
-    std::cout << "hello guys\n";
     return 0;
 }
