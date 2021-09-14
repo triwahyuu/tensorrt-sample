@@ -4,6 +4,7 @@
 #include <string>
 #include <memory>
 #include <numeric>
+#include <chrono>
 
 #include <NvInfer.h>
 #include <NvOnnxParser.h>
@@ -22,10 +23,11 @@ struct result_t
     size_t idx;
     std::string label;
 };
+using infer_result_t = std::vector<result_t>;
 
 struct ModelParams
 {
-    int32_t batch_size{-1};
+    size_t batch_size{1};
     bool fp16{false};
     size_t workspace_size{1_MiB};
     std::vector<std::string> input_names;
@@ -133,7 +135,8 @@ class SampleOnnx
 public:
     SampleOnnx(const ModelParams& params) :
         m_params(params),
-        m_engine(nullptr)
+        m_engine(nullptr),
+        m_infer_batch_size(1)
     {
     }
 
@@ -153,9 +156,13 @@ public:
 
     bool preprocess(const cv::Mat& image);
 
+    bool preprocess(const std::vector<std::string>& imgs_path);
+
+    bool preprocess(const std::vector<cv::Mat>& images);
+
     bool infer();
 
-    std::vector<result_t> postprocess(size_t topk);
+    std::vector<infer_result_t> postprocess(size_t topk);
 
     bool serialize();
 
@@ -177,6 +184,7 @@ private:
     std::vector<size_t> m_input_idx;
     std::vector<size_t> m_output_idx;
     std::vector<void *> m_buffers;
+    size_t m_infer_batch_size;
 
     TRTUniquePtr<nvinfer1::ICudaEngine> m_engine{nullptr};
     TRTUniquePtr<nvinfer1::IExecutionContext> m_context{nullptr};
@@ -214,7 +222,7 @@ bool SampleOnnx::init()
     for(size_t i = 0; i < m_engine->getNbBindings(); i++)
     {
         auto binding_dim = m_engine->getBindingDimensions(i);
-        auto binding_size = getSizeByDim(binding_dim) * m_params.batch_size * sizeof(float);
+        auto binding_size = getSizeByDim(binding_dim) * m_engine->getMaxBatchSize() * sizeof(float);
 
         // TODO: check cuda error
         void* temp;
@@ -262,7 +270,8 @@ bool SampleOnnx::prepare_engine()
     if(!parsed)
         return false;
 
-    config->setMaxWorkspaceSize(m_params.workspace_size);
+    builder->setMaxBatchSize(m_params.batch_size);
+    builder->setMaxWorkspaceSize(m_params.workspace_size);
     if (m_params.fp16)
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
 
@@ -362,12 +371,8 @@ bool SampleOnnx::deserialize(const std::string& filepath)
 
 bool SampleOnnx::preprocess(const std::string& img_path)
 {
-    auto img = cv::imread(img_path);
-    if (img.empty()) {
-        std::cerr << "load image " << img_path << " failed\n";
-        return false;
-    }
-    return preprocess(img);
+    std::vector<std::string> imgs_path{img_path};
+    return preprocess(imgs_path);
 }
 
 bool SampleOnnx::preprocess(const cv::Mat& image)
@@ -377,37 +382,106 @@ bool SampleOnnx::preprocess(const cv::Mat& image)
     auto input_channel = m_input_dims[0].d[1];
     auto input_size = cv::Size(input_width, input_height);
 
-    // cv::Mat resized;
-    // cv::resize(image, resized, input_size);
-    // cv::Mat input_img;
-    // resized.convertTo(input_img, CV_32FC3, 1.f/255.f);
-    // cv::subtract(input_img, cv::Scalar(0.485f, 0.456f, 0.406f), input_img);
-    // cv::divide(input_img, cv::Scalar(0.229f, 0.224f, 0.225f), input_img, 1, -1);
+    cv::Mat input_img;
+    cv::resize(image, input_img, input_size);
+    input_img.convertTo(input_img, CV_32FC3, 1.f/255.f);
+    cv::subtract(input_img, cv::Scalar(0.406f, 0.456f, 0.485f), input_img);
+    cv::divide(input_img, cv::Scalar(0.225f, 0.224f, 0.229f), input_img, 1, -1);
 
-    // cv::Mat flatten[input_channel];
-    // cv::split(input_img, flatten);
-    // for (size_t i = 0; i < input_channel; i++) {
+    std::vector<cv::Mat> flatten;
+    cv::split(input_img, flatten);
+    auto step = input_width * input_height;
+    auto count = step * sizeof(float);
+    for (size_t i = 0; i < input_channel; i++) {
+        auto ci = input_channel - i - 1;
+        CUDA_CHECK(cudaMemcpyAsync((float*)m_buffers[m_input_idx[0]] + i*step, flatten[ci].data, count, cudaMemcpyHostToDevice, m_stream));
+    }
 
-    // }
 
-    cv::cuda::GpuMat gpu_img;
-    gpu_img.upload(image);
-    cv::cuda::GpuMat resized;
-    cv::cuda::resize(gpu_img, resized, input_size, 0, 0, cv::INTER_NEAREST);
+    // cv::cuda::GpuMat gpu_img;
+    // gpu_img.upload(image);
+    // cv::cuda::GpuMat resized;
+    // cv::cuda::resize(gpu_img, resized, input_size, 0, 0, cv::INTER_NEAREST);
 
-    cv::cuda::GpuMat gpu_norm;
-    resized.convertTo(gpu_norm, CV_32FC3, 1.f/255.f);
-    cv::cuda::subtract(gpu_norm, cv::Scalar(0.406f, 0.456f, 0.485f), gpu_norm, cv::noArray());
-    cv::cuda::divide(gpu_norm, cv::Scalar(0.225f, 0.224f, 0.229f), gpu_norm);
-    // cv::cuda::subtract(gpu_norm, cv::Scalar(0.485f, 0.456f, 0.406f), gpu_norm, cv::noArray());
-    // cv::cuda::divide(gpu_norm, cv::Scalar(0.229f, 0.224f, 0.225f), gpu_norm);
+    // cv::cuda::GpuMat gpu_norm;
+    // resized.convertTo(gpu_norm, CV_32FC3, 1.f/255.f);
+    // cv::cuda::subtract(gpu_norm, cv::Scalar(0.406f, 0.456f, 0.485f), gpu_norm, cv::noArray());
+    // cv::cuda::divide(gpu_norm, cv::Scalar(0.225f, 0.224f, 0.229f), gpu_norm);
+    // // cv::cuda::subtract(gpu_norm, cv::Scalar(0.485f, 0.456f, 0.406f), gpu_norm, cv::noArray());
+    // // cv::cuda::divide(gpu_norm, cv::Scalar(0.229f, 0.224f, 0.225f), gpu_norm);
 
-    std::vector<cv::cuda::GpuMat> chw;
-    for (int i = input_channel-1; i >= 0; i--)
-        chw.push_back(cv::cuda::GpuMat(input_size, CV_32FC1, (float *) m_buffers[m_input_idx[0]] + i*input_width*input_height));
-    cv::cuda::split(gpu_norm, chw);
+    // std::vector<cv::cuda::GpuMat> chw;
+    // for (size_t i = input_channel; i > 0; i--)
+    //     chw.push_back(cv::cuda::GpuMat(input_size, CV_32FC1, (float *) m_buffers[m_input_idx[0]] + (i-1)*input_width*input_height));
+    // cv::cuda::split(gpu_norm, chw);
 
     return true;
+}
+
+bool SampleOnnx::preprocess(const std::vector<std::string>& imgs_path)
+{
+    std::vector<cv::Mat> images;
+    for (auto& img_path : imgs_path) {
+        auto img = cv::imread(img_path);
+        if (img.empty()) {
+            std::cerr << "load image " << img_path << " failed\n";
+            return false;
+        }
+        images.push_back(img);
+    }
+    return preprocess(images);
+}
+
+bool SampleOnnx::preprocess(const std::vector<cv::Mat>& images)
+{
+    auto input_channel = m_input_dims[0].d[1];
+    auto input_size = cv::Size(m_input_dims[0].d[3], m_input_dims[0].d[2]);
+    auto input_numel = getSizeByDim(m_input_dims[0]);
+    auto step = m_input_dims[0].d[3] * m_input_dims[0].d[2];
+    auto count = step * sizeof(float);
+    m_infer_batch_size = images.size();
+
+    for (size_t b = 0; b < images.size(); b++) {
+        cv::Mat input_img;
+        cv::resize(images[b], input_img, input_size);
+        input_img.convertTo(input_img, CV_32FC3, 1.f/255.f);
+        cv::subtract(input_img, cv::Scalar(0.406f, 0.456f, 0.485f), input_img);
+        cv::divide(input_img, cv::Scalar(0.225f, 0.224f, 0.229f), input_img, 1, -1);
+
+        std::vector<cv::Mat> flatten(input_channel);
+        cv::split(input_img, flatten);
+        for (size_t i = 0; i < input_channel; i++) {
+            auto ci = input_channel - i - 1;
+            CUDA_CHECK(cudaMemcpyAsync(
+                (float*)m_buffers[m_input_idx[0]] + i*step + input_numel*b,
+                flatten[ci].data,
+                count,
+                cudaMemcpyHostToDevice,
+                m_stream
+            ));
+        }
+
+        // cv::cuda::GpuMat gpu_img;
+        // gpu_img.upload(images[b]);
+        // cv::cuda::GpuMat resized;
+        // cv::cuda::resize(gpu_img, resized, input_size, 0, 0, cv::INTER_NEAREST);
+
+        // cv::cuda::GpuMat gpu_norm;
+        // resized.convertTo(gpu_norm, CV_32FC3, 1.f/255.f);
+        // cv::cuda::subtract(gpu_norm, cv::Scalar(0.406f, 0.456f, 0.485f), gpu_norm, cv::noArray());
+        // cv::cuda::divide(gpu_norm, cv::Scalar(0.225f, 0.224f, 0.229f), gpu_norm);
+        // // cv::cuda::subtract(gpu_norm, cv::Scalar(0.485f, 0.456f, 0.406f), gpu_norm, cv::noArray());
+        // // cv::cuda::divide(gpu_norm, cv::Scalar(0.229f, 0.224f, 0.225f), gpu_norm);
+
+        // std::vector<cv::cuda::GpuMat> chw;
+        // for (size_t i = input_channel; i > 0; i--) {
+        //     chw.push_back(
+        //         cv::cuda::GpuMat(input_size, CV_32FC1,
+        //             (float *) m_buffers[m_input_idx[0]] + (i-1)*step + input_numel*b)
+        //     );
+        // }
+        // cv::cuda::split(gpu_norm, chw);
+    }
 }
 
 bool SampleOnnx::infer()
@@ -417,40 +491,50 @@ bool SampleOnnx::infer()
     return true;
 }
 
-std::vector<result_t> SampleOnnx::postprocess(size_t topk)
+std::vector<infer_result_t> SampleOnnx::postprocess(size_t topk)
 {
-    std::vector<result_t> results(topk);
-    std::vector<float> output(getSizeByDim(m_output_dims[0]) * m_params.batch_size);
-    cudaMemcpy(output.data(), m_buffers[m_output_idx[0]], output.size() * sizeof(float), cudaMemcpyDeviceToHost);
+    assert(topk > 0);
+    std::vector<infer_result_t> batches_result;
+    for (size_t b = 0; b < m_infer_batch_size; b++) {
+        infer_result_t results(topk);
+        std::vector<float> output(getSizeByDim(m_output_dims[0]));
+        cudaMemcpy(
+            output.data(),
+            (float*) m_buffers[m_output_idx[0]] + b * output.size(),
+            output.size() * sizeof(float),
+            cudaMemcpyDeviceToHost
+        );
 
-    auto out_softmax = softmax(output);
-    std::vector<size_t> indices(getSizeByDim(m_output_dims[0]) * m_params.batch_size);
-    std::iota(indices.begin(), indices.end(), 0);
-    std::sort(
-        indices.begin(), indices.end(),
-        [&out_softmax](size_t i1, size_t i2){
-            return out_softmax[i1] > out_softmax[i2];
+        auto out_softmax = softmax(output);
+        std::vector<size_t> indices(output.size());
+        std::iota(indices.begin(), indices.end(), 0);
+        std::sort(
+            indices.begin(), indices.end(),
+            [&out_softmax](size_t i1, size_t i2){
+                return out_softmax[i1] > out_softmax[i2];
+            }
+        );
+        for (size_t i = 0; i < topk; i++) {
+            auto idx = indices[i];
+            results[i].conf = out_softmax[idx];
+            results[i].idx = idx;
+            results[i].label = m_class_names[idx];
         }
-    );
-    for (size_t i = 0; i < topk; i++) {
-        auto idx = indices[i];
-        results[i].conf = out_softmax[idx];
-        results[i].idx = idx;
-        results[i].label = m_class_names[idx];
+        batches_result.push_back(results);
     }
-    return results;
+    return batches_result;
 }
 
 
 int main(int argc, char **argv)
 {
     ModelParams mp;
-    mp.batch_size = 1;
+    mp.batch_size = 4;
     mp.fp16 = false;
-    mp.model_path = "/workspaces/tensorrt-sample/data/resnet18.onnx";
-    mp.engine_path = "/workspaces/tensorrt-sample/build/resnet18.rt";
-    // mp.model_path = "/workspaces/tensorrt-sample/data/resnet101.onnx";
-    // mp.engine_path = "/workspaces/tensorrt-sample/build/resnet101.rt";
+    // mp.model_path = "/workspaces/tensorrt-sample/data/resnet18.onnx";
+    // mp.engine_path = "/workspaces/tensorrt-sample/build/resnet18.rt";
+    mp.model_path = "/workspaces/tensorrt-sample/data/resnet101.onnx";
+    mp.engine_path = "/workspaces/tensorrt-sample/build/resnet101.rt";
     mp.names_path = "/workspaces/tensorrt-sample/data/imagenet-classes.txt";
     mp.workspace_size = 512_MiB;
 
@@ -459,18 +543,40 @@ int main(int argc, char **argv)
     if (argc > 1)
         img_path = argv[1];
 
-    {
-        SampleOnnx trt_engine(mp);
+    // {
+    //     SampleOnnx trt_engine(mp);
+    //     trt_engine.init();
 
-        trt_engine.init();
+    //     std::cout << "\n" << img_path << "\n";
+    //     trt_engine.preprocess(img_path);
+    //     trt_engine.infer();
+    //     auto results = trt_engine.postprocess(3);
+    //     for (auto& r : results) {
+    //         std::cout << r.idx << "  " << r.label << " (" << r.conf << ")\n";
+    //     }
+    // }
 
-        std::cout << "\n" << img_path << "\n";
-        trt_engine.preprocess(img_path);
-        trt_engine.infer();
-        auto results = trt_engine.postprocess(5);
-        for (auto& r : results) {
-            std::cout << r.idx << "  " << r.label << " (" << r.conf << ")\n";
-        }
+    auto img = cv::imread(img_path);
+    if (img.empty()) {
+        std::cerr << "load image " << img_path << " failed\n";
+        return false;
     }
+
+    SampleOnnx trt_engine(mp);
+    trt_engine.init();
+
+    std::cout << "inferencing...\n";
+    double sum = 0.;
+    for (size_t i = 0; i < 200; i++) {
+        auto start = std::chrono::high_resolution_clock::now();
+        trt_engine.preprocess(img);
+        trt_engine.infer();
+        trt_engine.postprocess(1);
+        auto duration = std::chrono::high_resolution_clock::now() - start;
+        sum += std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    }
+
+    std::cout << "latency: " << sum / (200.f * 1000) << "ms\n";
+
     return 0;
 }
