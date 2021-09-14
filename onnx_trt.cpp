@@ -271,7 +271,7 @@ bool SampleOnnx::prepare_engine()
         return false;
 
     builder->setMaxBatchSize(m_params.batch_size);
-    builder->setMaxWorkspaceSize(m_params.workspace_size);
+    config->setMaxWorkspaceSize(m_params.workspace_size);
     if (m_params.fp16)
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
 
@@ -377,45 +377,8 @@ bool SampleOnnx::preprocess(const std::string& img_path)
 
 bool SampleOnnx::preprocess(const cv::Mat& image)
 {
-    auto input_width = m_input_dims[0].d[3];
-    auto input_height = m_input_dims[0].d[2];
-    auto input_channel = m_input_dims[0].d[1];
-    auto input_size = cv::Size(input_width, input_height);
-
-    cv::Mat input_img;
-    cv::resize(image, input_img, input_size);
-    input_img.convertTo(input_img, CV_32FC3, 1.f/255.f);
-    cv::subtract(input_img, cv::Scalar(0.406f, 0.456f, 0.485f), input_img);
-    cv::divide(input_img, cv::Scalar(0.225f, 0.224f, 0.229f), input_img, 1, -1);
-
-    std::vector<cv::Mat> flatten;
-    cv::split(input_img, flatten);
-    auto step = input_width * input_height;
-    auto count = step * sizeof(float);
-    for (size_t i = 0; i < input_channel; i++) {
-        auto ci = input_channel - i - 1;
-        CUDA_CHECK(cudaMemcpyAsync((float*)m_buffers[m_input_idx[0]] + i*step, flatten[ci].data, count, cudaMemcpyHostToDevice, m_stream));
-    }
-
-
-    // cv::cuda::GpuMat gpu_img;
-    // gpu_img.upload(image);
-    // cv::cuda::GpuMat resized;
-    // cv::cuda::resize(gpu_img, resized, input_size, 0, 0, cv::INTER_NEAREST);
-
-    // cv::cuda::GpuMat gpu_norm;
-    // resized.convertTo(gpu_norm, CV_32FC3, 1.f/255.f);
-    // cv::cuda::subtract(gpu_norm, cv::Scalar(0.406f, 0.456f, 0.485f), gpu_norm, cv::noArray());
-    // cv::cuda::divide(gpu_norm, cv::Scalar(0.225f, 0.224f, 0.229f), gpu_norm);
-    // // cv::cuda::subtract(gpu_norm, cv::Scalar(0.485f, 0.456f, 0.406f), gpu_norm, cv::noArray());
-    // // cv::cuda::divide(gpu_norm, cv::Scalar(0.229f, 0.224f, 0.225f), gpu_norm);
-
-    // std::vector<cv::cuda::GpuMat> chw;
-    // for (size_t i = input_channel; i > 0; i--)
-    //     chw.push_back(cv::cuda::GpuMat(input_size, CV_32FC1, (float *) m_buffers[m_input_idx[0]] + (i-1)*input_width*input_height));
-    // cv::cuda::split(gpu_norm, chw);
-
-    return true;
+    std::vector<cv::Mat> imgs{image};
+    return preprocess(imgs);
 }
 
 bool SampleOnnx::preprocess(const std::vector<std::string>& imgs_path)
@@ -482,6 +445,8 @@ bool SampleOnnx::preprocess(const std::vector<cv::Mat>& images)
         // }
         // cv::cuda::split(gpu_norm, chw);
     }
+
+    return true;
 }
 
 bool SampleOnnx::infer()
