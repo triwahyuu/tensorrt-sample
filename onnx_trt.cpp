@@ -397,6 +397,7 @@ bool SampleOnnx::preprocess(const std::vector<std::string>& imgs_path)
 
 bool SampleOnnx::preprocess(const std::vector<cv::Mat>& images)
 {
+    CUDA_CHECK(cudaStreamSynchronize(m_stream));
     auto input_channel = m_input_dims[0].d[1];
     auto input_size = cv::Size(m_input_dims[0].d[3], m_input_dims[0].d[2]);
     auto input_numel = getSizeByDim(m_input_dims[0]);
@@ -415,8 +416,9 @@ bool SampleOnnx::preprocess(const std::vector<cv::Mat>& images)
         cv::split(input_img, flatten);
         for (size_t i = 0; i < input_channel; i++) {
             auto ci = input_channel - i - 1;
+            auto offset = i*step + input_numel*b;
             CUDA_CHECK(cudaMemcpyAsync(
-                (float*)m_buffers[m_input_idx[0]] + i*step + input_numel*b,
+                (float*)m_buffers[m_input_idx[0]] + offset,
                 flatten[ci].data,
                 count,
                 cudaMemcpyHostToDevice,
@@ -451,7 +453,7 @@ bool SampleOnnx::preprocess(const std::vector<cv::Mat>& images)
 
 bool SampleOnnx::infer()
 {
-    m_context->enqueue(m_params.batch_size, m_buffers.data(), m_stream, nullptr);
+    m_context->enqueue(m_infer_batch_size, m_buffers.data(), m_stream, nullptr);
     CUDA_CHECK(cudaStreamSynchronize(m_stream));
     return true;
 }
@@ -459,16 +461,29 @@ bool SampleOnnx::infer()
 std::vector<infer_result_t> SampleOnnx::postprocess(size_t topk)
 {
     assert(topk > 0);
-    std::vector<infer_result_t> batches_result;
+    auto sz = getSizeByDim(m_output_dims[0]);
+    std::vector<infer_result_t> batches_result(m_infer_batch_size);
+
+    std::vector<float> raw_outputs(m_infer_batch_size * sz, 0.f);
+    cudaMemcpy(
+        raw_outputs.data(),
+        (float*) m_buffers[m_output_idx[0]],
+        sz * m_infer_batch_size * sizeof(float),
+        cudaMemcpyDeviceToHost
+    );
+
     for (size_t b = 0; b < m_infer_batch_size; b++) {
         infer_result_t results(topk);
-        std::vector<float> output(getSizeByDim(m_output_dims[0]));
-        cudaMemcpy(
-            output.data(),
-            (float*) m_buffers[m_output_idx[0]] + b * output.size(),
-            output.size() * sizeof(float),
-            cudaMemcpyDeviceToHost
-        );
+
+        // std::vector<float> output(sz);
+        // cudaMemcpy(
+        //     output.data(),
+        //     (float*) m_buffers[m_output_idx[0]] + b * sz,
+        //     sz * sizeof(float),
+        //     cudaMemcpyDeviceToHost
+        // );
+
+        std::vector<float> output(raw_outputs.begin() + b*sz, raw_outputs.begin() + (b+1)*sz);
 
         auto out_softmax = softmax(output);
         std::vector<size_t> indices(output.size());
@@ -485,7 +500,7 @@ std::vector<infer_result_t> SampleOnnx::postprocess(size_t topk)
             results[i].idx = idx;
             results[i].label = m_class_names[idx];
         }
-        batches_result.push_back(results);
+        batches_result[b] = results;
     }
     return batches_result;
 }
@@ -508,40 +523,51 @@ int main(int argc, char **argv)
     if (argc > 1)
         img_path = argv[1];
 
-    // {
-    //     SampleOnnx trt_engine(mp);
-    //     trt_engine.init();
+    {
+        std::cout << mp.model_path << " with " << mp.batch_size << " batch size\n";
+        SampleOnnx trt_engine(mp);
+        trt_engine.init();
 
-    //     std::cout << "\n" << img_path << "\n";
-    //     trt_engine.preprocess(img_path);
-    //     trt_engine.infer();
-    //     auto results = trt_engine.postprocess(3);
-    //     for (auto& r : results) {
-    //         std::cout << r.idx << "  " << r.label << " (" << r.conf << ")\n";
-    //     }
+        std::vector<std::string> imgs_path{
+            "/workspaces/tensorrt-sample/data/eagle.jpg",
+            "/workspaces/tensorrt-sample/data/shark.jpg"
+        };
+        std::cout << "\n" << img_path << " with " << imgs_path.size() << " batch size\n";
+
+        trt_engine.preprocess(imgs_path);
+        trt_engine.infer();
+        auto batch_results = trt_engine.postprocess(3);
+        uint32_t nb = 0;
+        for (auto& results : batch_results) {
+            std::cout << "\nbatch " << nb << "\n";
+            for (auto& r : results) {
+                std::cout << "  " << r.idx << "  " << " (" << r.conf << ") " << r.label << "\n";
+            }
+            nb++;
+        }
+    }
+
+    // auto img = cv::imread(img_path);
+    // if (img.empty()) {
+    //     std::cerr << "load image " << img_path << " failed\n";
+    //     return false;
     // }
 
-    auto img = cv::imread(img_path);
-    if (img.empty()) {
-        std::cerr << "load image " << img_path << " failed\n";
-        return false;
-    }
+    // SampleOnnx trt_engine(mp);
+    // trt_engine.init();
 
-    SampleOnnx trt_engine(mp);
-    trt_engine.init();
+    // std::cout << "inferencing...\n";
+    // double sum = 0.;
+    // for (size_t i = 0; i < 200; i++) {
+    //     auto start = std::chrono::high_resolution_clock::now();
+    //     trt_engine.preprocess(img);
+    //     trt_engine.infer();
+    //     trt_engine.postprocess(1);
+    //     auto duration = std::chrono::high_resolution_clock::now() - start;
+    //     sum += std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
+    // }
 
-    std::cout << "inferencing...\n";
-    double sum = 0.;
-    for (size_t i = 0; i < 200; i++) {
-        auto start = std::chrono::high_resolution_clock::now();
-        trt_engine.preprocess(img);
-        trt_engine.infer();
-        trt_engine.postprocess(1);
-        auto duration = std::chrono::high_resolution_clock::now() - start;
-        sum += std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-    }
-
-    std::cout << "latency: " << sum / (200.f * 1000) << "ms\n";
+    // std::cout << "latency: " << sum / (200.f * 1000) << "ms\n";
 
     return 0;
 }
