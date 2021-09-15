@@ -77,6 +77,8 @@ RUN \
   && make install \
   && ldconfig
 
+RUN pip install pip --upgrade && \
+  pip install torch torchvision numpy matplotlib onnx
 
 ENV PATH="/usr/bin:${PATH}"
 WORKDIR /workspace

@@ -4,7 +4,9 @@
 	"extensions": [
 		"ms-vscode.cpptools",
 		"ms-vscode.cmake-tools",
-		"xaver.clang-format"
+		"xaver.clang-format",
+		"ms-python.python",
+		"ms-python.vscode-pylance"
 	],
 	"runArgs": [
 		"--cap-add=SYS_PTRACE",
