@@ -88,14 +88,10 @@ struct CudaStreamDestroy
 
 using CudaStreamUniquePtr = std::unique_ptr<cudaStream_t, CudaStreamDestroy>;
 
-size_t getSizeByDim(const nvinfer1::Dims& dims)
+size_t dims_volume(const nvinfer1::Dims& dims)
 {
-    size_t size = 1;
-    for (size_t i = 0; i < dims.nbDims; ++i)
-    {
-        size *= dims.d[i];
-    }
-    return size;
+    return std::accumulate(dims.d, dims.d + dims.nbDims, 1,
+        [](int32_t a, int32_t b){return a * ((b >= 0) ? b : b*(-1));});
 }
 
 bool file_exists(std::string& filename)
@@ -222,11 +218,10 @@ bool SampleOnnx::init()
     for(size_t i = 0; i < m_engine->getNbBindings(); i++)
     {
         auto binding_dim = m_engine->getBindingDimensions(i);
-        auto binding_size = getSizeByDim(binding_dim) * m_engine->getMaxBatchSize() * sizeof(float);
+        auto binding_size = dims_volume(binding_dim) * m_engine->getMaxBatchSize() * sizeof(float);
 
-        // TODO: check cuda error
         void* temp;
-        cudaMalloc(&temp, binding_size);
+        CUDA_CHECK(cudaMalloc(&temp, binding_size));
         m_buffers.push_back(temp);
         if(m_engine->bindingIsInput(i)) {
             m_input_dims.push_back(binding_dim);
@@ -275,6 +270,24 @@ bool SampleOnnx::prepare_engine()
     if (m_params.fp16)
         config->setFlag(nvinfer1::BuilderFlag::kFP16);
 
+    auto input = network->getInput(0);
+    auto input_name = input->getName();
+    auto indim = input->getDimensions();
+    uint32_t min_bs = 1, opt_bs = 1, max_bs = 1;
+    if (indim.d[0] < 0) {
+        opt_bs = int(m_params.batch_size/2);
+        max_bs = m_params.batch_size;
+    }
+
+    auto profile = builder->createOptimizationProfile();
+    profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kMIN,
+        nvinfer1::Dims4(min_bs, indim.d[1], indim.d[2], indim.d[3]));
+    profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kOPT,
+        nvinfer1::Dims4(opt_bs, indim.d[1], indim.d[2], indim.d[3]));
+    profile->setDimensions(input_name, nvinfer1::OptProfileSelector::kMAX,
+        nvinfer1::Dims4(max_bs, indim.d[1], indim.d[2], indim.d[3]));
+    config->addOptimizationProfile(profile);
+
     // TODO: enable DLA (?)
     // if(builder->getNbDLACores() > 0) {
     //     builder->setFp16Mode(true);
@@ -298,7 +311,6 @@ bool SampleOnnx::prepare_engine()
     if (m_context == nullptr)
         throw std::runtime_error("Execution Context creation failed");
 
-    cudaStreamDestroy(profile_stream);
     return true;
 }
 
@@ -400,10 +412,15 @@ bool SampleOnnx::preprocess(const std::vector<cv::Mat>& images)
     CUDA_CHECK(cudaStreamSynchronize(m_stream));
     auto input_channel = m_input_dims[0].d[1];
     auto input_size = cv::Size(m_input_dims[0].d[3], m_input_dims[0].d[2]);
-    auto input_numel = getSizeByDim(m_input_dims[0]);
+    auto input_numel = dims_volume(m_input_dims[0]);
     auto step = m_input_dims[0].d[3] * m_input_dims[0].d[2];
     auto count = step * sizeof(float);
     m_infer_batch_size = images.size();
+
+    auto infer_dims = nvinfer1::Dims4(
+        m_infer_batch_size, m_input_dims[0].d[1], m_input_dims[0].d[2], m_input_dims[0].d[3]
+    );
+    m_context->setBindingDimensions(m_input_idx[0], infer_dims);
 
     for (size_t b = 0; b < images.size(); b++) {
         cv::Mat input_img;
@@ -453,7 +470,7 @@ bool SampleOnnx::preprocess(const std::vector<cv::Mat>& images)
 
 bool SampleOnnx::infer()
 {
-    m_context->enqueue(m_infer_batch_size, m_buffers.data(), m_stream, nullptr);
+    m_context->enqueueV2(m_buffers.data(), m_stream, nullptr);
     CUDA_CHECK(cudaStreamSynchronize(m_stream));
     return true;
 }
@@ -461,7 +478,7 @@ bool SampleOnnx::infer()
 std::vector<infer_result_t> SampleOnnx::postprocess(size_t topk)
 {
     assert(topk > 0);
-    auto sz = getSizeByDim(m_output_dims[0]);
+    auto sz = dims_volume(m_output_dims[0]);
     std::vector<infer_result_t> batches_result(m_infer_batch_size);
 
     std::vector<float> raw_outputs(m_infer_batch_size * sz, 0.f);
@@ -474,15 +491,6 @@ std::vector<infer_result_t> SampleOnnx::postprocess(size_t topk)
 
     for (size_t b = 0; b < m_infer_batch_size; b++) {
         infer_result_t results(topk);
-
-        // std::vector<float> output(sz);
-        // cudaMemcpy(
-        //     output.data(),
-        //     (float*) m_buffers[m_output_idx[0]] + b * sz,
-        //     sz * sizeof(float),
-        //     cudaMemcpyDeviceToHost
-        // );
-
         std::vector<float> output(raw_outputs.begin() + b*sz, raw_outputs.begin() + (b+1)*sz);
 
         auto out_softmax = softmax(output);
@@ -513,8 +521,10 @@ int main(int argc, char **argv)
     mp.fp16 = false;
     // mp.model_path = "/workspaces/tensorrt-sample/data/resnet18.onnx";
     // mp.engine_path = "/workspaces/tensorrt-sample/build/resnet18.rt";
-    mp.model_path = "/workspaces/tensorrt-sample/data/resnet101.onnx";
-    mp.engine_path = "/workspaces/tensorrt-sample/build/resnet101.rt";
+    // mp.model_path = "/workspaces/tensorrt-sample/data/resnet101.onnx";
+    // mp.engine_path = "/workspaces/tensorrt-sample/build/resnet101.rt";
+    mp.model_path = "/workspaces/tensorrt-sample/data/resnet101_dynamic.onnx";
+    mp.engine_path = "/workspaces/tensorrt-sample/build/resnet101_dyn.rt";
     mp.names_path = "/workspaces/tensorrt-sample/data/imagenet-classes.txt";
     mp.workspace_size = 512_MiB;
 
