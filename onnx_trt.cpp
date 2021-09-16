@@ -27,7 +27,7 @@ using infer_result_t = std::vector<result_t>;
 
 struct ModelParams
 {
-    size_t batch_size{1};
+    int32_t batch_size{-1};
     bool fp16{false};
     size_t workspace_size{1_MiB};
     std::vector<std::string> input_names;
@@ -247,8 +247,9 @@ bool SampleOnnx::prepare_engine()
     if (!builder)
         return false;
 
-    const auto explicit_batch = 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
-    auto network = TRTUniquePtr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(explicit_batch));
+    auto network_flags = (m_params.batch_size < 0) ?
+        0U : 1U << static_cast<uint32_t>(nvinfer1::NetworkDefinitionCreationFlag::kEXPLICIT_BATCH);
+    auto network = TRTUniquePtr<nvinfer1::INetworkDefinition>(builder->createNetworkV2(network_flags));
     if (!network)
         throw std::runtime_error("Network creation failed");
 
